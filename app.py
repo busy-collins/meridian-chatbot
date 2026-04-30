@@ -1,105 +1,201 @@
-"""
-Meridian Electronics Customer Support Agent
-- Connects to MCP (Streamable HTTP)
-- Uses OpenAI Agents SDK
-- Provides lightweight tracing logs
-"""
 import os
-import time
-import json
-import uuid
-import asyncio
-import logging
-from typing import Any, Optional
-
+import re
+import gradio as gr
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
-from agents import Agent, Runner, OpenAIChatCompletionsModel
-from agents.mcp import MCPServerStreamableHttp, MCPServerStreamableHttpParams
+from agent import run_support_agent
 
 load_dotenv(override=True)
 
-logger = logging.getLogger("meridian")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+EMAIL_RE     = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+")
+PIN_RE       = re.compile(r"\b(\d{4})\b")
+ORDER_INTENT = re.compile(
+    r"\b(order|orders|history|track|status|purchase|checkout|place|buy)\b",
+    re.IGNORECASE,
+)
 
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL")  # required in HF Secrets
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MAX_TURNS      = int(os.getenv("MAX_TURNS", "10"))
-TIMEOUT_S      = float(os.getenv("AGENT_TIMEOUT_S", "25"))
+def new_session():
+    return {"authed": False, "customer_id": None, "email": None, "pending": None}
 
-INSTRUCTIONS = """
-You are a customer support assistant for Meridian Electronics.
+def session_label(s):
+    if s and s.get("authed"):
+        return f"**Session:** Authenticated — {s.get('email', '')}"
+    return "**Session:** Not authenticated"
 
-You can:
-- Product discovery: list_products, search_products, get_product
-- Authentication: verify_customer_pin (email + 4-digit PIN)
-- Order history: list_orders, get_order (requires auth)
-- Place orders: create_order (requires auth)
+def needs_auth(msg):
+    return bool(ORDER_INTENT.search(msg or ""))
 
-Rules:
-- Always authenticate before order actions.
-- Never guess SKUs; use search/get_product.
-- Confirm order details before creating an order.
-- Be concise, professional, and helpful.
-"""
+def extract_email_pin(msg):
+    e = EMAIL_RE.search(msg or "")
+    p = PIN_RE.search(msg or "")
+    return (e.group(0) if e else None, p.group(1) if p else None)
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-def _history_to_text(history: Any) -> str:
-    """
-    Normalize history from Gradio into a transcript.
-    history is typically list[tuple[user, assistant]].
-    """
-    if not history:
+def content_to_str(content):
+    if content is None:
         return ""
-    lines = []
-    for h in history:
-        if isinstance(h, (list, tuple)) and len(h) == 2:
-            u, a = h
-            lines.append(f"Customer: {u}")
-            lines.append(f"Agent: {a}")
-    return "\n".join(lines) + "\n\n"
+    if isinstanceontent, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(item.get("text", str(item)))
+            elif hasattr(item, "text"):
+                parts.append(item.text)
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(content)
 
-async def _run_agent_inner(message: str, history: Any, trace_id: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return f"Server misconfigured: missing OPENAI_API_KEY. (trace: {trace_id})"
-    if not MCP_SERVER_URL:
-        return f"Server misconfigured: missing MCP_SERVER_URL. (trace: {trace_id})"
+async def verify_pin_direct(email, pin):
+    from agents.mcp import MCPServerStreamableHttp, MCPServerStreamableHttpParams
+    mcp_url = os.getenv("MCP_SERVER_URL")
+    if not mcp_url:
+        return False, None, "Missing MCP_SERVER_URL"
+    try:
+        params = MCPServerStreamableHttpParams(url=mcp_url)
+        async with MCPServerStreamableHttp(params=params) as mcp:
+            res  = await mcp.call_tool("verify_customer_pin", {"email": email, "pin": pin})
+            raw  = getattr(res, "content", None) or getattr(res, "output", None) or res
+            text = content_to_str(raw)
+            failed = any(w in text.lower() for w in [
+                "invalid", "error", "not found", "incorrect", "wrong", "failed"
+            ])
+            if failed:
+                return False, None, text
+            uuid_m = re.search(
+                r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
+                text
+            )
+            customer_id = uuid_m.group(0) if uuid_m else None
+            return True, customer_id, text
+    except Exception as exc:
+        return False, None, str(exc)
 
-    client = AsyncOpenAI(api_key=api_key)
-    full_input = _history_to_text(history) + f"Customer: {message}"
+def history_to_tuples(history):
+    tuples = []
+    i = 0
+    while i < len(history) - 1:
+        h, a = history[i], history[i + 1]
+        if (isinstance(h, dict) and h.get("role") == "user"
+                and isinstance(a, dict) and a.get("role") == "assistant"):
+            tuples.append((h["content"], a["content"]))
+            i += 2
+        else:
+            i += 1
+    return tuples
 
-    params = MCPServerStreamableHttpParams(url=MCP_SERVER_URL)
+def add(history, role, content):
+    return history + [{"role": role, "content": content}]
 
-    t_mcp0 = _now_ms()
-    async with MCPServerStreamableHttp(params=params) as mcp:
-        logger.info(json.dumps({"trace": trace_id, "event": "mcp_connected", "ms": _now_ms() - t_mcp0}))
+async def respond(message, history, session):
+    if not message.strip():
+        return "", history, session, session_label(session)
 
-        agent = Agent(
-            name="Meridian Support Agent",
-            instructions=INSTRUCTIONS,
-            model=OpenAIChatCompletionsModel(model=OPENAI_MODEL, openai_client=client),
-            mcp_servers=[mcp],
+    session = session or new_session()
+    hist    = history_to_tuples(history)
+
+    # Not authenticated + order intent
+    if not session["authed"] and needs_auth(message):
+        session["pending"] = message
+        reply = (
+            "I can help with that. To access order information "
+            "I need to verify your identity first.\n\n"
+            "Please send your **email** and **4-digit PIN** — "
+            "for example: `jane@example.com 1234`"
+        )
+        history = add(add(history, "user", message), "assistant", reply)
+        return "", history, session, session_label(session)
+
+    # Awaiting credentials
+    if not session["authed"] and session.get("pending"):
+        email, pin = extract_email_pin(message)
+        if not email or not pin:
+            reply = "Please send your email and 4-dit PIN together — e.g. `jane@example.com 1234`"
+            history = add(add(history, "user", message), "assistant", reply)
+            return "", history, session, session_label(session)
+
+        ok, customer_id, raw = await verify_pin_direct(email, pin)
+        if not ok:
+            reply = f"Could not verify credentials. Please check and try again.\n\n_{raw[:200]}_"
+            history = add(add(history, "user", message), "assistant", reply)
+            return "", history, session, session_label(session)
+
+        session["authed"]      = True
+        session["customer_id"] = customer_id
+        session["email"]       = email
+        pending                = session.pop("pending")
+
+        ctx = f" [SYSTEM: Verified. Email: {email}"
+        if customer_id:
+            ctx += f" Customer ID: {customer_id}"
+        ctx += "]"
+
+        agent_reply = await run_support_agent(pending + ctx, hist)
+        reply       = f"Identity verified — welcome back!\n\n{agent_reply}"
+        history     = add(add(histo"user", message), "assistant", reply)
+        return "", history, session, session_label(session)
+
+    # Authenticated
+    enriched = message
+    if session["authed"] and session.get("customer_id"):
+        enriched = (
+            f"{message} [SYSTEM: Authenticated. "
+            f"Email: {session['email']} "
+            f"Customer ID: {session['customer_id']}]"
         )
 
-        result = await Runner.run(agent, input=full_input, max_turns=MAX_TURNS)
-        return result.final_output or ""
+    reply   = await run_support_agent(enriched, hist)
+    history = add(add(history, "user", message), "assistant", reply)
+    return "", history, session, session_label(session)
 
-async def run_support_agent(message: str, history: Any = None, trace_id: Optional[str] = None) -> str:
-    """
-    Main entry used by app.py
-    """
-    trace_id = trace_id or str(uuid.uuid4())[:8]
-    t0 = _now_ms()
+def do_clear():
+    s = new_session()
+    return "", [], s, session_label(s)
 
-    try:
-        out = await asyncio.wait_for(_run_agent_inner(message, history, trace_id), timeout=TIMEOUT_S)
-        logger.info(json.dumps({"trace": trace_id, "event": "agent_done", "total_ms": _now_ms() - t0}))
-        return out
-    except asyncio.TimeoutError:
-        return f"Our support tools are taking too long right now. Please try again. (trace: {trace_id})"
-    except Exception as e:
-        logger.exception(json.dumps({"trace": trace_id, "event": "agent_error", "msg": str(e)[:200]}))
-        return f"Sorry — I couldn’t complete that right now. Please try again. (trace: {trace_id})"
+with gr.Blocks(title="Meridian Electronics Support", theme=gr.themes.Soft()) as demo:
+
+    state  = gr.State(new_session())
+    gr.Markdown(
+        "# Meridian Electronics — Customer Support\n"
+        "I can help with **product availability**, **order history**, "
+        "**placing orders**, and **account queries**."
+    )
+    banner  = gr.Markdown(session_label(new_session()))
+  chatbot = gr.Chatbot(height=500)
+
+    with gr.Row():
+        box  = gr.Textbox(
+            placeholder="e.g. What monitors do you have in stock?",
+            container=False, scale=8
+        )
+        btn  = gr.Button("Send", variant="primary", scale=1)
+
+    clear = gr.Button("Clear Chat")
+
+    gr.Examples(
+        examples=[
+            "What monitors do you have available?",
+            "Search for wireless keyboards",
+            "I want to check my order history",
+            "I want to place an order",
+        ],
+        inputs=[box]
+    )
+
+    gr.Markdown("---\n*Powered by OpenAI Agents SDK + MCP | Meridian Electronics 2026*")
+
+    ins  = [box, chatbot, state]
+    outs = [box, chatbot, state, banner]
+
+    btn.click(respond,   inputs=ins, outputs=outs)
+    box.submit(respond,  inputs=ins, outputs=outs)
+    clear.click(do_clear, outputs=outs)
+
+if __name__ == "__main__":
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.getenv("PORT", "7860")),
+        share=False,
+    )
