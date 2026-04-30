@@ -32,7 +32,7 @@ def extract_email_pin(msg):
 def content_to_str(content):
     if content is None:
         return ""
-    if isinstanceontent, str):
+    if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
@@ -112,7 +112,7 @@ async def respond(message, history, session):
     if not session["authed"] and session.get("pending"):
         email, pin = extract_email_pin(message)
         if not email or not pin:
-            reply = "Please send your email and 4-dit PIN together — e.g. `jane@example.com 1234`"
+            reply = "Please send your email and 4-digit PIN together — e.g. `jane@example.com 1234`"
             history = add(add(history, "user", message), "assistant", reply)
             return "", history, session, session_label(session)
 
@@ -134,7 +134,7 @@ async def respond(message, history, session):
 
         agent_reply = await run_support_agent(pending + ctx, hist)
         reply       = f"Identity verified — welcome back!\n\n{agent_reply}"
-        history     = add(add(histo"user", message), "assistant", reply)
+        history     = add(add(history, "user", message), "assistant", reply)
         return "", history, session, session_label(session)
 
     # Authenticated
@@ -163,7 +163,7 @@ with gr.Blocks(title="Meridian Electronics Support", theme=gr.themes.Soft()) as 
         "**placing orders**, and **account queries**."
     )
     banner  = gr.Markdown(session_label(new_session()))
-  chatbot = gr.Chatbot(height=500)
+    chatbot = gr.Chatbot(height=500)
 
     with gr.Row():
         box  = gr.Textbox(
