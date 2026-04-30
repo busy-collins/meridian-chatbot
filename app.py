@@ -154,7 +154,7 @@ def do_clear():
     s = new_session()
     return "", [], s, session_label(s)
 
-with gr.Blocks(title="Meridian Electronics Support", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Meridian Electronics Support") as demo:
 
     state  = gr.State(new_session())
     gr.Markdown(
@@ -198,4 +198,5 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=int(os.getenv("PORT", "7860")),
         share=False,
+        theme=gr.themes.Soft(),
     )
