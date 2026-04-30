@@ -25,7 +25,7 @@ async def respond(message, history, session):
 def do_clear():
     return "", [], new_session(), session_label(new_session())
 
-with gr.Blocks(title="Meridian Electronics Support") as demo:
+with gr.Blocks(title="Meridian Electronics Support", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         "# Meridian Electronics — Customer Support\n"
         "I can help with **product availability**, **order history**, "       "**placing orders**, and **account queries**."
