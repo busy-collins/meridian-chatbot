@@ -27,7 +27,7 @@ Meridian Electronics handles all customer inquiries manually via phone and email
 
 ## Live Demo
 
-Visit: https://huggingface.co/spaces/busy-collins/meridian-support
+Visit: https://huggingface.co/spaces/busycollins/meridian-space
 
 ---
 
